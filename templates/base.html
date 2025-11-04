@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{% block title %}TDS Dashboard{% endblock %}</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+  </head>
+  <body>
+    <aside class="sidebar">
+      <div class="brand">WaterWatch</div>
+      <nav>
+        <a class="nav-item active" href="{{ url_for('index') }}">Live</a>
+        <a class="nav-item" href="#">History</a>
+        <a class="nav-item" href="#">Devices</a>
+        <a class="nav-item" href="#">Settings</a>
+      </nav>
+      <div class="meta">
+        <small>Auto-refresh 3s</small>
+      </div>
+    </aside>
+
+    <div class="wrap">
+      <header class="topbar">
+        <h1>{% block header %}Live Readings{% endblock %}</h1>
+        <span id="status" class="badge">Connecting…</span>
+      </header>
+
+      <main class="content">
+        {% block content %}{% endblock %}
+      </main>
+    </div>
+  </body>
+</html>

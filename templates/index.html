@@ -1,0 +1,103 @@
+{% extends "base.html" %}
+{% block title %}TDS Dashboard{% endblock %}
+{% block header %}Live Readings{% endblock %}
+
+{% block content %}
+<section class="cards">
+  <div class="card">
+    <h3>TDS (ppm)</h3>
+    <div id="tds" class="big">—</div>
+    <small id="tdsQuality" class="chip">—</small>
+  </div>
+  <div class="card">
+    <h3>Voltage (V)</h3>
+    <div id="voltage" class="big">—</div>
+  </div>
+  <div class="card">
+    <h3>Raw</h3>
+    <div id="raw" class="big">—</div>
+  </div>
+  <div class="card">
+    <h3>Device</h3>
+    <div id="device" class="big mono">—</div>
+    <small id="ts" class="mono muted">—</small>
+  </div>
+</section>
+
+<section class="panel">
+  <div class="panel-head">
+    <h3>Latest JSON</h3>
+    <button id="refreshBtn" class="btn">Refresh</button>
+  </div>
+  <pre id="json" class="pre">[]</pre>
+</section>
+
+<section class="panel">
+  <div class="panel-head"><h3>Recent Readings</h3></div>
+  <div class="table">
+    <div class="row head">
+      <div>Device</div><div>TDS (ppm)</div><div>Voltage</div><div>Raw</div><div>Timestamp</div>
+    </div>
+    <div id="rows"></div>
+  </div>
+</section>
+
+<script>
+function gradeTDS(tds){
+  if (tds < 300) return {label: "Excellent", cls: "ok"};
+  if (tds < 600) return {label: "Good", cls: "warn"};
+  return {label: "High", cls: "bad"};
+}
+
+async function loadLatest(){
+  try{
+    const r = await fetch('/api/latest', {cache: 'no-store'});
+    if(!r.ok) throw new Error('HTTP '+r.status);
+    const data = await r.json();
+
+    document.getElementById('json').textContent = JSON.stringify(data, null, 2);
+    const status = document.getElementById('status');
+    status.textContent = 'Live'; status.className = 'badge ok';
+
+    if (data.length > 0){
+      const item = data[data.length-1];
+      const tds = Number(item.tds ?? 0);
+      const volt = Number(item.voltage ?? 0);
+      const raw = item.raw ?? 0;
+
+      document.getElementById('tds').textContent = tds.toFixed(1);
+      document.getElementById('voltage').textContent = volt.toFixed(3);
+      document.getElementById('raw').textContent = raw;
+      document.getElementById('device').textContent = item.device_id ?? '—';
+      document.getElementById('ts').textContent = item.ts ?? '—';
+
+      const q = gradeTDS(tds);
+      const chip = document.getElementById('tdsQuality');
+      chip.textContent = q.label;
+      chip.className = 'chip ' + q.cls;
+    }
+
+    // table rows
+    const rows = document.getElementById('rows');
+    rows.innerHTML = '';
+    data.slice(-10).reverse().forEach(d=>{
+      const r = document.createElement('div');
+      r.className = 'row';
+      r.innerHTML = `
+        <div>${d.device_id ?? '—'}</div>
+        <div>${Number(d.tds ?? 0).toFixed(1)}</div>
+        <div>${Number(d.voltage ?? 0).toFixed(3)}</div>
+        <div>${d.raw ?? '—'}</div>
+        <div class="mono">${d.ts ?? '—'}</div>`;
+      rows.appendChild(r);
+    });
+  }catch(e){
+    const status = document.getElementById('status');
+    status.textContent = 'Offline'; status.className = 'badge bad';
+  }
+}
+document.getElementById('refreshBtn').addEventListener('click', loadLatest);
+setInterval(loadLatest, 3000);
+loadLatest();
+</script>
+{% endblock %}
