@@ -1,103 +1,445 @@
 {% extends "base.html" %}
-{% block title %}TDS Dashboard{% endblock %}
-{% block header %}Live Readings{% endblock %}
+{% block title %}Live Water Quality Monitor{% endblock %}
+{% block header %}Live Water Quality Monitor{% endblock %}
 
 {% block content %}
+
+<section class="analysis-container fade-in">
+  <div id="analysisStatus">
+    <span class="status-indicator idle">
+      <span class="dot"></span>
+      <span>Waiting for device connection...</span>
+    </span>
+  </div>
+
+  <div id="progressSection" style="display: none;">
+    <div class="progress-section">
+      <div class="progress-label">
+        <span>Collecting readings</span>
+        <span id="readingCount">0/10</span>
+      </div>
+      <div class="progress-bar">
+        <div class="progress-fill" id="progressFill" style="width: 0%"></div>
+      </div>
+    </div>
+    <div class="loading-text" id="loadingMessage" style="display: none;">
+      <div class="spinner"></div>
+      <span>AI is analyzing your water quality...</span>
+    </div>
+  </div>
+
+  <div id="analysisResult" style="display: none;">
+    </div>
+</section>
+
 <section class="cards">
   <div class="card">
-    <h3>TDS (ppm)</h3>
+    <h3>Current TDS</h3>
     <div id="tds" class="big">—</div>
     <small id="tdsQuality" class="chip">—</small>
   </div>
   <div class="card">
-    <h3>Voltage (V)</h3>
+    <h3>Voltage</h3>
     <div id="voltage" class="big">—</div>
+    <small class="muted">Volts</small>
   </div>
   <div class="card">
-    <h3>Raw</h3>
+    <h3>Raw Value</h3>
     <div id="raw" class="big">—</div>
   </div>
   <div class="card">
-    <h3>Device</h3>
-    <div id="device" class="big mono">—</div>
+    <h3>Device ID</h3>
+    <div id="device" class="big mono" style="font-size: 20px;">—</div>
     <small id="ts" class="mono muted">—</small>
   </div>
 </section>
 
 <section class="panel">
   <div class="panel-head">
-    <h3>Latest JSON</h3>
-    <button id="refreshBtn" class="btn">Refresh</button>
+    <h3>Recent Readings</h3>
+    <button id="resetBtn" class="btn" onclick="resetAnalysis()">🔄 New Analysis</button>
   </div>
-  <pre id="json" class="pre">[]</pre>
-</section>
-
-<section class="panel">
-  <div class="panel-head"><h3>Recent Readings</h3></div>
   <div class="table">
     <div class="row head">
       <div>Device</div><div>TDS (ppm)</div><div>Voltage</div><div>Raw</div><div>Timestamp</div>
     </div>
-    <div id="rows"></div>
+    <div id="rows">
+      <div class="empty-state">
+        <div class="empty-state-text">No readings yet</div>
+      </div>
+    </div>
   </div>
 </section>
 
+{% endblock %}
+
+{% block scripts %}
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+
 <script>
-function gradeTDS(tds){
-  if (tds < 300) return {label: "Excellent", cls: "ok"};
-  if (tds < 600) return {label: "Good", cls: "warn"};
-  return {label: "High", cls: "bad"};
+const FRESH_WINDOW_MS = 8000;
+const FAIL_GRACE_MS = 6000;
+let DEVICE_ID = 'device-1';
+let sessionStarted = false;
+let sessionProgress = 0;
+let sessionFailed = false;
+let lastSeenTsEpoch = null;
+let lastSeenTsString = null;
+let disconnectSince = null;
+
+let analysisFrozen = false;
+let lastCompleteHash = null;
+let uiMode = 'idle';
+const pollHandles = { latest: null, status: null };
+
+function isFresh(tsEpoch) {
+  if (!tsEpoch) return false;
+  return (Date.now() - tsEpoch) <= FRESH_WINDOW_MS;
 }
 
-async function loadLatest(){
-  try{
-    const r = await fetch('/api/latest', {cache: 'no-store'});
-    if(!r.ok) throw new Error('HTTP '+r.status);
-    const data = await r.json();
+function gradeTDS(tds) {
+  if (tds < 300) return { label: "Excellent", cls: "ok" };
+  if (tds < 600) return { label: "Good", cls: "warn" };
+  return { label: "High", cls: "bad" };
+}
 
-    document.getElementById('json').textContent = JSON.stringify(data, null, 2);
-    const status = document.getElementById('status');
-    status.textContent = 'Live'; status.className = 'badge ok';
+function setMode(mode) {
+  if (uiMode === mode) return false;
+  uiMode = mode;
+  return true;
+}
 
-    if (data.length > 0){
-      const item = data[data.length-1];
-      const tds = Number(item.tds ?? 0);
-      const volt = Number(item.voltage ?? 0);
-      const raw = item.raw ?? 0;
+function stopPolling() {
+  if (pollHandles.latest) {
+    clearInterval(pollHandles.latest);
+    pollHandles.latest = null;
+  }
+  if (pollHandles.status) {
+    clearInterval(pollHandles.status);
+    pollHandles.status = null;
+  }
+}
 
-      document.getElementById('tds').textContent = tds.toFixed(1);
-      document.getElementById('voltage').textContent = volt.toFixed(3);
-      document.getElementById('raw').textContent = raw;
-      document.getElementById('device').textContent = item.device_id ?? '—';
-      document.getElementById('ts').textContent = item.ts ?? '—';
+function startPolling() {
+  stopPolling();
+  pollHandles.latest = setInterval(loadLatest, 2000);
+  pollHandles.status = setInterval(checkAnalysisStatus, 2000);
+}
 
-      const q = gradeTDS(tds);
+function updateAnalysisUI(state) {
+  const deviceConnected = sessionStarted && isFresh(lastSeenTsEpoch);
+  state.device_connected = deviceConnected;
+
+  const statusDiv = document.getElementById('analysisStatus');
+  const progressSection = document.getElementById('progressSection');
+  const analysisResult = document.getElementById('analysisResult');
+  const deviceStatus = document.getElementById('deviceStatus');
+  const loadingMessage = document.getElementById('loadingMessage');
+  const readingCount = document.getElementById('readingCount');
+  const progressFill = document.getElementById('progressFill');
+
+  if (deviceConnected) {
+    deviceStatus.textContent = '✅ Device Connected';
+    deviceStatus.className = 'badge ok';
+  } else {
+    deviceStatus.textContent = '⏳ Waiting for device';
+    deviceStatus.className = 'badge';
+  }
+
+  if (analysisFrozen) return;
+
+  if (sessionFailed && sessionProgress < 10) {
+    if (setMode('failed')) {
+      statusDiv.innerHTML = `
+        <span class="status-indicator failed">
+          <span class="dot"></span>
+          <span>Device disconnected • Test failed • Retry again</span>
+        </span>
+        <div style="margin-top:10px">
+          <button class="btn" onclick="resetAnalysis()">🔄 Retry</button>
+        </div>
+      `;
+      progressSection.style.display = 'none';
+      analysisResult.style.display = 'none';
+    }
+    analysisFrozen = true;
+    stopPolling();
+    return;
+  }
+
+  if (state.status === 'complete' && state.avg_tds !== null && state.explanation) {
+    const avg = Number(state.avg_tds || 0);
+    const hash = `${avg.toFixed(3)}|${(state.explanation || '').length}|${state.started_at || ''}`;
+    if (lastCompleteHash !== hash) {
+      lastCompleteHash = hash;
+      statusDiv.innerHTML = `
+        <span class="status-indicator connected">
+          <span class="dot"></span>
+          <span>Analysis Complete ✨</span>
+        </span>
+      `;
+      progressSection.style.display = 'none';
+      const quality = gradeTDS(avg);
+      const deviceName = document.getElementById('device')?.textContent || DEVICE_ID;
+      analysisResult.innerHTML = `
+        <div class="analysis-result fade-in">
+          <div class="result-header">
+            <div style="flex: 1;">
+              <div class="tds-label">Average TDS Reading • <span class="mono">${deviceName}</span></div>
+              <div class="tds-value">${avg.toFixed(1)}
+                <span style="font-size: 24px; color: var(--muted);">ppm</span>
+              </div>
+              <span class="chip ${quality.cls}">${quality.label}</span>
+            </div>
+            <div>
+              <button class="btn primary" onclick="resetAnalysis()" style="font-size: 14px; padding: 10px 20px;">
+                🧪 New Test
+              </button>
+            </div>
+          </div>
+          <div class="ai-explanation">
+            ${marked.parse(state.explanation)}
+          </div>
+        </div>
+      `;
+      analysisResult.style.display = 'block';
+      const tdsEl = document.getElementById('tds');
+      const chip = document.getElementById('tdsQuality');
+      if (tdsEl) tdsEl.textContent = avg.toFixed(1);
+      if (chip) {
+        chip.textContent = quality.label;
+        chip.className = 'chip ' + quality.cls;
+      }
+    }
+    sessionProgress = 10;
+    setMode('complete');
+    analysisFrozen = true;
+    stopPolling();
+    return;
+  }
+
+  if (state.status === 'analyzing') {
+    if (setMode('analyzing')) {
+      statusDiv.innerHTML = `
+        <span class="status-indicator analyzing">
+          <span class="dot"></span>
+          <span>Analyzing with AI...</span>
+        </span>
+      `;
+      progressSection.style.display = 'block';
+      readingCount.textContent = '10/10';
+      progressFill.style.width = '100%';
+      loadingMessage.style.display = 'flex';
+      analysisResult.style.display = 'none';
+    }
+    return;
+  }
+
+  if (deviceConnected && sessionProgress > 0 && sessionProgress < 10) {
+    if (setMode('collecting')) {
+      statusDiv.innerHTML = `
+        <span class="status-indicator collecting">
+          <span class="dot"></span>
+          <span>Device Connected • Collecting readings...</span>
+        </span>
+      `;
+      progressSection.style.display = 'block';
+      loadingMessage.style.display = 'none';
+      analysisResult.style.display = 'none';
+    }
+    const pct = Math.min((sessionProgress / 10) * 100, 100);
+    readingCount.textContent = `${sessionProgress}/10`;
+    progressFill.style.width = pct + '%';
+    return;
+  }
+
+  if (setMode('idle')) {
+    statusDiv.innerHTML = `
+      <span class="status-indicator idle">
+        <span class="dot"></span>
+        <span>Waiting for device connection...</span>
+      </span>
+    `;
+    progressSection.style.display = 'none';
+    analysisResult.style.display = 'none';
+  }
+}
+
+async function checkAnalysisStatus() {
+  try {
+    const response = await fetch(`/api/analysis_status?device_id=${encodeURIComponent(DEVICE_ID)}`, { cache: 'no-store' });
+    const state = await response.json();
+    state.device_connected = sessionStarted && isFresh(lastSeenTsEpoch);
+    updateAnalysisUI(state);
+  } catch (error) {
+    console.error('Failed to check analysis status:', error);
+  }
+}
+
+async function loadLatest() {
+  try {
+    const response = await fetch('/api/latest', { cache: 'no-store' });
+    if (!response.ok) throw new Error('HTTP ' + response.status);
+    const data = await response.json();
+    
+    let candidate = data.find(d => d.device_id === DEVICE_ID) || null;
+    if (!candidate && data.length > 0) {
+      candidate = data.reduce((acc, d) => {
+        const ta = acc?.ts ? Date.parse(acc.ts) : 0;
+        const tb = d?.ts ? Date.parse(d.ts) : 0;
+        return tb > ta ? d : acc;
+      }, null);
+      if (candidate?.device_id && DEVICE_ID !== candidate.device_id) {
+        DEVICE_ID = candidate.device_id;
+      }
+    }
+    
+    if (candidate?.ts) {
+      const tsString = candidate.ts;
+      const tsEpoch = Date.parse(tsString);
+      
+      if (lastSeenTsString === null) {
+        lastSeenTsString = tsString;
+        lastSeenTsEpoch = tsEpoch;
+        sessionStarted = true;
+        sessionProgress = 1;
+        console.log('📊 Reading 1/10 - First reading detected');
+      } else if (tsString !== lastSeenTsString) {
+        lastSeenTsString = tsString;
+        lastSeenTsEpoch = tsEpoch;
+        if (sessionProgress < 10) {
+          sessionProgress += 1;
+          console.log(`📊 Reading ${sessionProgress}/10 - New reading detected`);
+        }
+        disconnectSince = null;
+        sessionFailed = false;
+      }
+    }
+    
+    const connectedNow = sessionStarted && isFresh(lastSeenTsEpoch);
+    if (!connectedNow && sessionStarted && sessionProgress > 0 && sessionProgress < 10) {
+      if (!disconnectSince) disconnectSince = Date.now();
+      if (Date.now() - disconnectSince > FAIL_GRACE_MS) {
+        sessionFailed = true;
+        console.log('⚠️ Device disconnected during collection');
+      }
+    } else {
+      disconnectSince = null;
+    }
+    
+    if (!analysisFrozen && candidate) {
+      const tds = Number(candidate.tds ?? 0);
+      const volt = Number(candidate.voltage ?? 0);
+      const raw = candidate.raw ?? 0;
+      document.getElementById('tds').textContent = isNaN(tds) ? '—' : tds.toFixed(1);
+      document.getElementById('voltage').textContent = isNaN(volt) ? '—' : volt.toFixed(3);
+      document.getElementById('raw').textContent = raw ?? '—';
+      document.getElementById('device').textContent = candidate.device_id ?? '—';
+      document.getElementById('ts').textContent = candidate.ts ? formatTimeDetailed(candidate.ts) : '—';
+      const q = gradeTDS(tds || 0);
       const chip = document.getElementById('tdsQuality');
       chip.textContent = q.label;
       chip.className = 'chip ' + q.cls;
     }
-
-    // table rows
+    
     const rows = document.getElementById('rows');
-    rows.innerHTML = '';
-    data.slice(-10).reverse().forEach(d=>{
-      const r = document.createElement('div');
-      r.className = 'row';
-      r.innerHTML = `
-        <div>${d.device_id ?? '—'}</div>
-        <div>${Number(d.tds ?? 0).toFixed(1)}</div>
-        <div>${Number(d.voltage ?? 0).toFixed(3)}</div>
-        <div>${d.raw ?? '—'}</div>
-        <div class="mono">${d.ts ?? '—'}</div>`;
-      rows.appendChild(r);
-    });
-  }catch(e){
-    const status = document.getElementById('status');
-    status.textContent = 'Offline'; status.className = 'badge bad';
+    if (data.length === 0) {
+      rows.innerHTML = `
+        <div class="empty-state">
+          <div class="empty-state-text">No readings yet</div>
+        </div>
+      `;
+    } else {
+      rows.innerHTML = data.slice(-10).reverse().map(d => `
+        <div class="row">
+          <div>${d.device_id ?? '—'}</div>
+          <div>${Number(d.tds ?? 0).toFixed(1)}</div>
+          <div>${Number(d.voltage ?? 0).toFixed(3)}</div>
+          <div>${d.raw ?? '—'}</div>
+          <div class="mono">${d.ts ? formatTimeDetailed(d.ts) : '—'}</div>
+        </div>
+      `).join('');
+    }
+    
+    if (!analysisFrozen) checkAnalysisStatus();
+  } catch (error) {
+    console.error('Failed to load latest readings:', error);
   }
 }
-document.getElementById('refreshBtn').addEventListener('click', loadLatest);
-setInterval(loadLatest, 3000);
+
+async function resetAnalysis() {
+  sessionStarted = false;
+  sessionProgress = 0;
+  sessionFailed = false;
+  lastSeenTsEpoch = null;
+  lastSeenTsString = null;
+  disconnectSince = null;
+  analysisFrozen = false;
+  lastCompleteHash = null;
+  setMode('idle');
+  document.body.classList.remove('view-historical');
+  try {
+    const response = await fetch('/api/reset_analysis', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ device_id: DEVICE_ID })
+    });
+    if (response.ok) {
+      document.getElementById('analysisResult').style.display = 'none';
+      document.getElementById('analysisResult').innerHTML = '';
+      console.log('🔄 Analysis reset - Ready for new readings');
+      loadLatest();
+      startPolling();
+      if (typeof loadHistory === 'function') loadHistory();
+    }
+  } catch (error) {
+    console.error('Failed to reset analysis:', error);
+  }
+}
+
+window.addEventListener('showAnalysisDetail', (event) => {
+  const detail = event.detail;
+  analysisFrozen = true;
+  stopPolling();
+  setMode('historical');
+  const analysisResult = document.getElementById('analysisResult');
+  const statusDiv = document.getElementById('analysisStatus');
+  const progressSection = document.getElementById('progressSection');
+  statusDiv.innerHTML = `
+    <span class="status-indicator connected">
+      <span class="dot"></span>
+      <span>Viewing Historical Analysis</span>
+    </span>
+  `;
+  progressSection.style.display = 'none';
+  const quality = gradeTDS(detail.avg_tds_ppm);
+  analysisResult.innerHTML = `
+    <div class="analysis-result fade-in">
+      <div class="result-header">
+        <div>
+          <div class="tds-label">
+            Average TDS Reading • <span class="mono">${detail.device_id}</span> • ${formatTimeDetailed(detail.ts_iso)}
+          </div>
+          <div class="tds-value">${detail.avg_tds_ppm.toFixed(1)}
+            <span style="font-size: 24px; color: var(--muted);">ppm</span>
+          </div>
+          <span class="chip ${quality.cls}">${quality.label}</span>
+        </div>
+      </div>
+      <div class="ai-explanation">
+        ${marked.parse(detail.ai_explanation)}
+      </div>
+    </div>
+  `;
+
+  document.body.classList.add('view-historical');
+  analysisResult.style.display = 'block';
+  window.scrollTo({ top: 0, behavior: 'smooth' });
+});
+
+console.log('🌊 WaterWatch Dashboard Initialized');
 loadLatest();
+startPolling();
 </script>
+
 {% endblock %}

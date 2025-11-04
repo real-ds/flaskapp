@@ -1,0 +1,104 @@
+{% extends "base.html" %}
+{% block title %}Neighbourhood Data{% endblock %}
+{% block header %}Neighbourhood Data{% endblock %}
+
+{% block content %}
+<section class="content-panel">
+  <div class="panel-head">
+    <h3>Chennai Slum Area Water Quality (Mock Data)</h3>
+  </div>
+  <p class="muted" style="margin-top: -10px; margin-bottom: 20px;">
+    This is a demonstration using static, mock data. In a real application, this would come from a live database of sensors.
+  </p>
+  
+  <div class="neighbourhood-grid" id="neighbourhoodGrid">
+    <div class="empty-state">
+      <div class="spinner"></div>
+      <div class="empty-state-text">Loading neighbourhood data...</div>
+    </div>
+  </div>
+</section>
+{% endblock %}
+
+{% block scripts %}
+<script>
+// Helper function to grade TDS (copied from index.html)
+function gradeTDS(tds) {
+  if (tds < 300) return { label: "Excellent", cls: "ok" };
+  if (tds < 600) return { label: "Good", cls: "warn" };
+  if (tds < 900) return { label: "High", cls: "bad" };
+  return { label: "Very High", cls: "bad" };
+}
+
+// Function to format time (e.g., "5m ago")
+// You probably have this in your base.html, if so, you can remove this
+// But included here just in case.
+function formatTimeAgo(dateString) {
+  if (!dateString) return '—';
+  try {
+    const date = new Date(dateString);
+    const now = new Date();
+    const seconds = Math.round((now - date) / 1000);
+    const minutes = Math.round(seconds / 60);
+    const hours = Math.round(minutes / 60);
+    const days = Math.round(hours / 24);
+
+    if (seconds < 60) return `${seconds}s ago`;
+    if (minutes < 60) return `${minutes}m ago`;
+    if (hours < 24) return `${hours}h ago`;
+    return `${days}d ago`;
+  } catch (e) {
+    return '—';
+  }
+}
+
+// Main function to load data
+async function loadNeighbourhoodData() {
+  const grid = document.getElementById('neighbourhoodGrid');
+  if (!grid) return;
+
+  try {
+    const response = await fetch('/api/neighbourhood_data');
+    if (!response.ok) throw new Error('Failed to load data');
+    const data = await response.json();
+
+    if (data.length === 0) {
+      grid.innerHTML = `<div class="empty-state">No data available.</div>`;
+      return;
+    }
+
+    // Clear loading spinner
+    grid.innerHTML = '';
+
+    // Create and append a card for each item
+    data.forEach(item => {
+      const quality = gradeTDS(item.tds);
+      const card = document.createElement('div');
+      card.className = 'neighbourhood-card fade-in';
+      
+      card.innerHTML = `
+        <div class="card-header">
+          <span class="location-name">${item.name}</span>
+          <span class="chip ${quality.cls}">${quality.label}</span>
+        </div>
+        <div class="tds-value">
+          ${item.tds.toFixed(1)} <span class="unit">ppm</span>
+        </div>
+        <div class="card-footer">
+          <span class="muted">${item.location}</span>
+          <span class="muted">${formatTimeAgo(item.last_updated)}</span>
+        </div>
+      `;
+      grid.appendChild(card);
+    });
+
+  } catch (error) {
+    console.error('Failed to load neighbourhood data:', error);
+    grid.innerHTML = `<div class="empty-state">Could not load data.</div>`;
+  }
+}
+
+// Load data when the page is ready
+window.addEventListener('DOMContentLoaded', loadNeighbourhoodData);
+</script>
+{% endblock %}
